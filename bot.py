@@ -58,6 +58,10 @@ PHOTO_BATCH_DELAY = float(os.environ.get("PHOTO_BATCH_DELAY", "1.5"))
 def parse_buttons(text: str):
     """Pull out (label, url) pairs and return the text with those tags stripped out."""
     text = text or ""
+    # Phone keyboards/autocorrect often sneak a space in right after "://"
+    # (e.g. "https:// example.com"), which would otherwise silently fail to
+    # match as a URL and leave the raw [Label - URL] tag sitting in the post.
+    text = re.sub(r"(https?://)\s+", r"\1", text)
     buttons = BUTTON_PATTERN.findall(text)
     cleaned = BUTTON_PATTERN.sub("", text).strip()
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()  # collapse leftover blank lines
