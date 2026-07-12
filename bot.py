@@ -1,4 +1,5 @@
 import asyncio
+import html
 import mimetypes
 import os
 import re
@@ -8,7 +9,7 @@ import tempfile
 from pathlib import Path
 
 import imageio_ffmpeg
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -45,6 +46,14 @@ TEXT_MESSAGE_LIMIT = 4096
 # lets several forwards sent back-to-back land as one properly-numbered set.
 AUDIO_BATCH_DELAY = float(os.environ.get("AUDIO_BATCH_DELAY", "1.5"))
 
+# ---- Multi-photo post config ----
+# Telegram's sendMediaGroup hard caps an album at 10 items — there's no way
+# around this, so extra photos beyond it get dropped with a warning.
+PHOTO_GROUP_LIMIT = 10
+# How long to wait after the last photo in an album before building the
+# preview — lets all the photos in the album land before we act.
+PHOTO_BATCH_DELAY = float(os.environ.get("PHOTO_BATCH_DELAY", "1.5"))
+
 
 def parse_buttons(text: str):
     """Pull out (label, url) pairs and return the text with those tags stripped out."""
@@ -61,6 +70,20 @@ def build_markup(buttons):
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton(label.strip(), url=url.strip())] for label, url in buttons]
     )
+
+
+def build_caption_html(text: str, buttons) -> str:
+    """Telegram media groups can't carry an inline keyboard, so any
+    [Label - URL] tags become tappable HTML links appended to the caption
+    instead of buttons."""
+    escaped = html.escape(text)
+    if not buttons:
+        return escaped
+    links = "\n".join(
+        f'🔗 <a href="{html.escape(url.strip(), quote=True)}">{html.escape(label.strip())}</a>'
+        for label, url in buttons
+    )
+    return f"{escaped}\n\n{links}" if escaped else links
 
 
 def is_admin(user_id: int) -> bool:
@@ -114,11 +137,16 @@ TEXT_HELP = (
     "📝 Text & Photo Posts\n\n"
     "Send me the post you want published to the channel.\n\n"
     "• Plain text, or a photo with a caption — both work.\n"
+    "• Send 2–10 photos together as an album (one caption on any of them) "
+    "to post them all at once. Telegram caps albums at 10 photos, so "
+    "anything past the 10th gets dropped.\n"
     "• Add buttons anywhere in the text with this format:\n"
     "  [Button Label - https://example.com]\n"
     "• Add as many as you want, one per line:\n\n"
     "[REGISTER NOW - https://vireonwebsite.com.ng]\n"
     "[JOIN CHANNEL - https://t.me/yourchannel]\n\n"
+    "Note: multi-photo albums can't carry buttons (a Telegram limitation) — "
+    "any tags become tappable links in the caption instead.\n\n"
     "I'll show you a preview with a Confirm / Cancel button before anything "
     "goes live in the channel."
 )
@@ -172,6 +200,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = update.message
+
+    if msg.photo and msg.media_group_id:
+        await queue_photo_group(update, context)
+        return
+
     photo = msg.photo[-1].file_id if msg.photo else None
     raw_text = msg.caption if photo else msg.text
 
@@ -199,7 +232,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Stash the pending post for this admin until they confirm.
+    await send_single_preview(context, update.effective_chat.id, photo, cleaned_text, buttons)
+
+
+async def send_single_preview(context, chat_id, photo, cleaned_text, buttons):
+    """Stash a pending single photo/text post and show its preview with Confirm/Cancel."""
     context.user_data["pending_post"] = {
         "photo": photo,
         "text": cleaned_text,
@@ -219,18 +256,132 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if photo:
-            await msg.reply_photo(
+            await context.bot.send_photo(
+                chat_id=chat_id,
                 photo=photo,
                 caption=cleaned_text or None,
                 reply_markup=preview_markup,
             )
         else:
-            await msg.reply_text(cleaned_text, reply_markup=preview_markup)
-        await msg.reply_text(f"👆 Preview — {len(buttons)} button(s) attached. Confirm to post.")
+            await context.bot.send_message(chat_id=chat_id, text=cleaned_text, reply_markup=preview_markup)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"👆 Preview — {len(buttons)} button(s) attached. Confirm to post.",
+        )
     except BadRequest as e:
         logger.exception("Failed to build preview")
         context.user_data.pop("pending_post", None)
-        await msg.reply_text(f"⚠️ Telegram rejected that message: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Telegram rejected that message: {e}")
+
+
+async def queue_photo_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Collect photos belonging to the same forwarded/sent album.
+
+    Telegram delivers each photo in an album as a separate update sharing a
+    media_group_id, in the order they were sent. We buffer them per-user and
+    wait a short beat after the last arrival before building the preview.
+    """
+    msg = update.message
+    group_id = msg.media_group_id
+
+    if context.user_data.get("photo_group_id") != group_id:
+        context.user_data["photo_group_id"] = group_id
+        context.user_data["photo_group_photos"] = []
+        context.user_data["photo_group_caption"] = ""
+
+    context.user_data["photo_group_photos"].append(msg.photo[-1].file_id)
+    if msg.caption:
+        context.user_data["photo_group_caption"] = msg.caption
+
+    existing_task = context.user_data.get("photo_group_task")
+    if existing_task and not existing_task.done():
+        existing_task.cancel()
+    context.user_data["photo_group_task"] = asyncio.create_task(
+        _flush_photo_group(context, update.effective_chat.id, group_id)
+    )
+
+
+async def _flush_photo_group(context: ContextTypes.DEFAULT_TYPE, chat_id: int, group_id: str):
+    try:
+        await asyncio.sleep(PHOTO_BATCH_DELAY)
+    except asyncio.CancelledError:
+        return  # a newer photo arrived and superseded this flush
+
+    if context.user_data.get("photo_group_id") != group_id:
+        return  # a different album has already taken over
+
+    photos = context.user_data.pop("photo_group_photos", [])
+    caption = context.user_data.pop("photo_group_caption", "")
+    context.user_data.pop("photo_group_id", None)
+    context.user_data.pop("photo_group_task", None)
+    if not photos:
+        return
+
+    cleaned_text, buttons = parse_buttons(caption)
+    if len(cleaned_text) > PHOTO_CAPTION_LIMIT:
+        over = len(cleaned_text) - PHOTO_CAPTION_LIMIT
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ That caption is {len(cleaned_text)} characters — {over} over Telegram's "
+            f"{PHOTO_CAPTION_LIMIT}-character limit. Trim it and resend the album.",
+        )
+        return
+
+    dropped = 0
+    if len(photos) > PHOTO_GROUP_LIMIT:
+        dropped = len(photos) - PHOTO_GROUP_LIMIT
+        photos = photos[:PHOTO_GROUP_LIMIT]
+
+    if len(photos) == 1:
+        # sendMediaGroup requires 2+ items — fall back to a normal single
+        # photo post, which also restores full button support.
+        await send_single_preview(context, chat_id, photos[0], cleaned_text, buttons)
+        return
+
+    await send_album_preview(context, chat_id, photos, cleaned_text, buttons, dropped)
+
+
+async def send_album_preview(context, chat_id, photos, cleaned_text, buttons, dropped=0):
+    """Stash a pending multi-photo post and show its preview with Confirm/Cancel."""
+    caption_html = build_caption_html(cleaned_text, buttons)
+    context.user_data["pending_post"] = {
+        "photos": photos,
+        "text": cleaned_text,
+        "caption_html": caption_html,
+        "buttons": buttons,
+    }
+
+    media = [
+        InputMediaPhoto(pid, caption=caption_html if i == 0 else None, parse_mode="HTML" if i == 0 else None)
+        for i, pid in enumerate(photos)
+    ]
+
+    try:
+        await context.bot.send_media_group(chat_id=chat_id, media=media)
+    except BadRequest as e:
+        logger.exception("Failed to build album preview")
+        context.user_data.pop("pending_post", None)
+        await context.bot.send_message(chat_id=chat_id, text=f"⚠️ Telegram rejected that album: {e}")
+        return
+
+    confirm_markup = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Post to channel", callback_data="confirm_post"),
+                InlineKeyboardButton("❌ Cancel", callback_data="cancel_post"),
+            ]
+        ]
+    )
+    note = f"👆 Preview — {len(photos)} photo(s)"
+    if buttons:
+        note += f", {len(buttons)} link(s) embedded in the caption (buttons aren't supported on albums)"
+    if dropped:
+        note += (
+            f"\n⚠️ Telegram allows max {PHOTO_GROUP_LIMIT} photos per post — "
+            f"{dropped} extra photo(s) were dropped."
+        )
+    note += ". Confirm to post."
+    await context.bot.send_message(chat_id=chat_id, text=note, reply_markup=confirm_markup)
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -326,20 +477,29 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if query.data == "confirm_post":
-        markup = build_markup(pending["buttons"])
         try:
-            if pending["photo"]:
+            if pending.get("photos"):
+                media = [
+                    InputMediaPhoto(
+                        pid,
+                        caption=pending["caption_html"] if i == 0 else None,
+                        parse_mode="HTML" if i == 0 else None,
+                    )
+                    for i, pid in enumerate(pending["photos"])
+                ]
+                await context.bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+            elif pending.get("photo"):
                 await context.bot.send_photo(
                     chat_id=CHANNEL_ID,
                     photo=pending["photo"],
                     caption=pending["text"] or None,
-                    reply_markup=markup,
+                    reply_markup=build_markup(pending["buttons"]),
                 )
             else:
                 await context.bot.send_message(
                     chat_id=CHANNEL_ID,
                     text=pending["text"],
-                    reply_markup=markup,
+                    reply_markup=build_markup(pending["buttons"]),
                 )
             await query.edit_message_reply_markup(reply_markup=None)
             await query.message.reply_text("✅ Posted to the channel.")
