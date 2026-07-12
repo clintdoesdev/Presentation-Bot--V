@@ -47,7 +47,25 @@ registration.
 The bot replies with a preview (same buttons + a Confirm/Cancel row). Tap
 **✅ Post to channel** and it goes live; **❌ Cancel** discards it.
 
-## 5. Deploy to Railway
+## 5. Download forwarded audio
+
+Forward the bot one or more audio files (or voice notes) — it downloads
+each one to the `downloads/` folder on the server. If you forward several
+at once, it waits a beat for them all to land, then saves them numbered in
+the order they were forwarded (`01 - Track One.mp3`, `02 - Track Two.mp3`,
+...) so the sequence is preserved. A single forward is saved with its
+original name.
+
+- **AUDIO_DOWNLOAD_DIR** (optional): where files are saved. Defaults to
+  `downloads/`.
+- **AUDIO_BATCH_DELAY** (optional): seconds to wait after the last forward
+  before saving the batch. Defaults to `1.5`.
+
+Note: on Railway (or any host without a persistent volume) this folder is
+wiped on every redeploy/restart — fine for grabbing files during a session,
+but don't rely on it as long-term storage.
+
+## 6. Deploy to Railway
 1. Push this folder to a new GitHub repo.
 2. On Railway: **New Project → Deploy from GitHub repo** → pick the repo.
 3. Railway auto-detects Python and the `Procfile` (runs `python bot.py` as a
@@ -58,7 +76,7 @@ The bot replies with a preview (same buttons + a Confirm/Cancel row). Tap
    - `ADMIN_IDS`
 5. Deploy. Check the logs for `Bot starting (polling)...` to confirm it's live.
 
-## 6. Test locally (optional)
+## 7. Test locally (optional)
 ```bash
 python -m venv .venv
 source .venv/bin/activate

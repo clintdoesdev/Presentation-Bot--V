@@ -1,6 +1,9 @@
+import asyncio
+import mimetypes
 import os
 import re
 import logging
+from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
@@ -34,6 +37,12 @@ BUTTON_PATTERN = re.compile(r"\[\s*([^\[\]\-]+?)\s*-\s*(https?://[^\s\]]+)\s*\]"
 PHOTO_CAPTION_LIMIT = 1024
 TEXT_MESSAGE_LIMIT = 4096
 
+# ---- Audio download config ----
+AUDIO_DOWNLOAD_DIR = Path(os.environ.get("AUDIO_DOWNLOAD_DIR", "downloads"))
+# How long to wait after the last forwarded audio before saving the batch —
+# lets several forwards sent back-to-back land as one properly-numbered set.
+AUDIO_BATCH_DELAY = float(os.environ.get("AUDIO_BATCH_DELAY", "1.5"))
+
 
 def parse_buttons(text: str):
     """Pull out (label, url) pairs and return the text with those tags stripped out."""
@@ -56,6 +65,50 @@ def is_admin(user_id: int) -> bool:
     return not ADMIN_IDS or user_id in ADMIN_IDS
 
 
+def sanitize_filename(name: str) -> str:
+    name = re.sub(r'[\\/*?:"<>|\r\n]', "", name).strip(" .")
+    return name or "audio"
+
+
+def unique_path(path: Path) -> Path:
+    """Avoid clobbering a previous download that happens to share a name."""
+    if not path.exists():
+        return path
+    i = 2
+    while True:
+        candidate = path.with_name(f"{path.stem} ({i}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+        i += 1
+
+
+def audio_source(msg):
+    """Return (file_id, suggested_filename) for an audio-bearing message, or None."""
+    if msg.audio:
+        a = msg.audio
+        if a.file_name:
+            stem, ext = Path(a.file_name).stem, Path(a.file_name).suffix
+        else:
+            stem = " - ".join(filter(None, [a.performer, a.title])) or "audio"
+            ext = mimetypes.guess_extension(a.mime_type or "") or ".mp3"
+        return a.file_id, sanitize_filename(stem) + ext
+
+    if msg.voice:
+        v = msg.voice
+        ext = mimetypes.guess_extension(v.mime_type or "") or ".ogg"
+        return v.file_id, "voice" + ext
+
+    if msg.document and (msg.document.mime_type or "").startswith("audio/"):
+        d = msg.document
+        base = d.file_name or "audio"
+        stem, ext = Path(base).stem, Path(base).suffix
+        if not ext:
+            ext = mimetypes.guess_extension(d.mime_type or "") or ""
+        return d.file_id, sanitize_filename(stem) + ext
+
+    return None
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("You're not authorized to use this bot.")
@@ -69,7 +122,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "[REGISTER NOW - https://vireonwebsite.com.ng]\n"
         "[JOIN CHANNEL - https://t.me/yourchannel]\n\n"
         "I'll show you a preview with a Confirm / Cancel button before anything "
-        "goes live in the channel."
+        "goes live in the channel.\n\n"
+        "• Forward me one or more audio/voice files and I'll download them, "
+        "numbered in the order you forwarded them."
     )
 
 
@@ -140,6 +195,71 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"⚠️ Telegram rejected that message: {e}")
 
 
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Queue up forwarded audio/voice/document-audio for download.
+
+    Telegram delivers a batch of forwarded files as separate updates in the
+    order they were forwarded, so each one is appended to a per-chat queue.
+    We wait a short beat after the last arrival before saving the whole
+    batch, numbering the files 1..N in that same order.
+    """
+    user = update.effective_user
+    if not is_admin(user.id):
+        return
+
+    msg = update.message
+    source = audio_source(msg)
+    if not source:
+        return
+    file_id, suggested_name = source
+
+    chat_id = update.effective_chat.id
+    queue = context.chat_data.setdefault("audio_queue", [])
+    queue.append((file_id, suggested_name))
+
+    existing_task = context.chat_data.get("audio_flush_task")
+    if existing_task and not existing_task.done():
+        existing_task.cancel()
+    context.chat_data["audio_flush_task"] = asyncio.create_task(
+        _flush_audio_queue(context, chat_id)
+    )
+
+
+async def _flush_audio_queue(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    try:
+        await asyncio.sleep(AUDIO_BATCH_DELAY)
+    except asyncio.CancelledError:
+        return  # a newer audio arrived and superseded this flush
+
+    queue = context.chat_data.pop("audio_queue", [])
+    context.chat_data.pop("audio_flush_task", None)
+    if not queue:
+        return
+
+    AUDIO_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    width = len(str(len(queue)))
+    saved, failed = [], []
+
+    for i, (file_id, suggested_name) in enumerate(queue, start=1):
+        filename = f"{i:0{width}d} - {suggested_name}" if len(queue) > 1 else suggested_name
+        dest = unique_path(AUDIO_DOWNLOAD_DIR / filename)
+        try:
+            tg_file = await context.bot.get_file(file_id)
+            await tg_file.download_to_drive(custom_path=dest)
+            saved.append(dest.name)
+        except Exception:
+            logger.exception("Failed to download forwarded audio (%s)", suggested_name)
+            failed.append(suggested_name)
+
+    lines = [f"⬇️ Downloaded {len(saved)} audio file(s):"]
+    lines += [f"• {name}" for name in saved]
+    if failed:
+        lines.append(f"⚠️ Failed to download {len(failed)}:")
+        lines += [f"• {name}" for name in failed]
+
+    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+
+
 async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -199,6 +319,12 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(
+        MessageHandler(
+            (filters.AUDIO | filters.VOICE | filters.Document.AUDIO) & ~filters.COMMAND,
+            handle_audio,
+        )
+    )
     app.add_handler(
         MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, handle_message)
     )
