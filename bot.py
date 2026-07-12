@@ -3,8 +3,11 @@ import mimetypes
 import os
 import re
 import logging
+import subprocess
+import tempfile
 from pathlib import Path
 
+import imageio_ffmpeg
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -38,8 +41,7 @@ PHOTO_CAPTION_LIMIT = 1024
 TEXT_MESSAGE_LIMIT = 4096
 
 # ---- Audio download config ----
-AUDIO_DOWNLOAD_DIR = Path(os.environ.get("AUDIO_DOWNLOAD_DIR", "downloads"))
-# How long to wait after the last forwarded audio before saving the batch —
+# How long to wait after the last forwarded audio before processing the batch —
 # lets several forwards sent back-to-back land as one properly-numbered set.
 AUDIO_BATCH_DELAY = float(os.environ.get("AUDIO_BATCH_DELAY", "1.5"))
 
@@ -70,16 +72,13 @@ def sanitize_filename(name: str) -> str:
     return name or "audio"
 
 
-def unique_path(path: Path) -> Path:
-    """Avoid clobbering a previous download that happens to share a name."""
-    if not path.exists():
-        return path
-    i = 2
-    while True:
-        candidate = path.with_name(f"{path.stem} ({i}){path.suffix}")
-        if not candidate.exists():
-            return candidate
-        i += 1
+def convert_to_mp3(src: Path, dest: Path):
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    subprocess.run(
+        [ffmpeg_exe, "-y", "-i", str(src), "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", str(dest)],
+        check=True,
+        capture_output=True,
+    )
 
 
 def audio_source(msg):
@@ -109,23 +108,62 @@ def audio_source(msg):
     return None
 
 
+MAIN_MENU_TEXT = "👋 What would you like to do?"
+
+TEXT_HELP = (
+    "📝 Text & Photo Posts\n\n"
+    "Send me the post you want published to the channel.\n\n"
+    "• Plain text, or a photo with a caption — both work.\n"
+    "• Add buttons anywhere in the text with this format:\n"
+    "  [Button Label - https://example.com]\n"
+    "• Add as many as you want, one per line:\n\n"
+    "[REGISTER NOW - https://vireonwebsite.com.ng]\n"
+    "[JOIN CHANNEL - https://t.me/yourchannel]\n\n"
+    "I'll show you a preview with a Confirm / Cancel button before anything "
+    "goes live in the channel."
+)
+
+AUDIO_HELP = (
+    "🎧 Audio Downloads\n\n"
+    "Forward me one or more audio files or voice notes. I'll convert each "
+    "one to MP3 and send it right back to you here, numbered in the order "
+    "you forwarded them (01, 02, ...) — just tap each file in the chat to "
+    "download it."
+)
+
+
+def main_menu_markup():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📝 Text & Photo Posts", callback_data="menu:text")],
+            [InlineKeyboardButton("🎧 Audio Downloads", callback_data="menu:audio")],
+        ]
+    )
+
+
+def back_to_menu_markup():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="menu:main")]])
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("You're not authorized to use this bot.")
         return
-    await update.message.reply_text(
-        "👋 Send me the post you want published to the channel.\n\n"
-        "• Plain text, or a photo with a caption — both work.\n"
-        "• Add buttons anywhere in the text with this format:\n"
-        "  [Button Label - https://example.com]\n"
-        "• Add as many as you want, one per line:\n\n"
-        "[REGISTER NOW - https://vireonwebsite.com.ng]\n"
-        "[JOIN CHANNEL - https://t.me/yourchannel]\n\n"
-        "I'll show you a preview with a Confirm / Cancel button before anything "
-        "goes live in the channel.\n\n"
-        "• Forward me one or more audio/voice files and I'll download them, "
-        "numbered in the order you forwarded them."
-    )
+    await update.message.reply_text(MAIN_MENU_TEXT, reply_markup=main_menu_markup())
+
+
+async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+
+    if query.data == "menu:text":
+        await query.edit_message_text(TEXT_HELP, reply_markup=back_to_menu_markup())
+    elif query.data == "menu:audio":
+        await query.edit_message_text(AUDIO_HELP, reply_markup=back_to_menu_markup())
+    else:  # menu:main
+        await query.edit_message_text(MAIN_MENU_TEXT, reply_markup=main_menu_markup())
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -236,28 +274,37 @@ async def _flush_audio_queue(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     if not queue:
         return
 
-    AUDIO_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     width = len(str(len(queue)))
-    saved, failed = [], []
+    failed = []
 
-    for i, (file_id, suggested_name) in enumerate(queue, start=1):
-        filename = f"{i:0{width}d} - {suggested_name}" if len(queue) > 1 else suggested_name
-        dest = unique_path(AUDIO_DOWNLOAD_DIR / filename)
-        try:
-            tg_file = await context.bot.get_file(file_id)
-            await tg_file.download_to_drive(custom_path=dest)
-            saved.append(dest.name)
-        except Exception:
-            logger.exception("Failed to download forwarded audio (%s)", suggested_name)
-            failed.append(suggested_name)
+    with tempfile.TemporaryDirectory(prefix="audio_dl_") as tmp:
+        tmp_dir = Path(tmp)
+        for i, (file_id, suggested_name) in enumerate(queue, start=1):
+            stem, ext = Path(suggested_name).stem, Path(suggested_name).suffix
+            mp3_name = f"{i:0{width}d} - {stem}.mp3" if len(queue) > 1 else f"{stem}.mp3"
+            try:
+                tg_file = await context.bot.get_file(file_id)
+                src_path = tmp_dir / f"src_{i}{ext}"
+                await tg_file.download_to_drive(custom_path=src_path)
 
-    lines = [f"⬇️ Downloaded {len(saved)} audio file(s):"]
-    lines += [f"• {name}" for name in saved]
+                mp3_path = tmp_dir / mp3_name
+                if ext.lower() == ".mp3":
+                    src_path.replace(mp3_path)
+                else:
+                    await asyncio.to_thread(convert_to_mp3, src_path, mp3_path)
+
+                with open(mp3_path, "rb") as f:
+                    await context.bot.send_audio(
+                        chat_id=chat_id, audio=f, filename=mp3_name, title=stem
+                    )
+            except Exception:
+                logger.exception("Failed to convert/send forwarded audio (%s)", suggested_name)
+                failed.append(suggested_name)
+
     if failed:
-        lines.append(f"⚠️ Failed to download {len(failed)}:")
+        lines = [f"⚠️ Failed to convert/send {len(failed)} file(s):"]
         lines += [f"• {name}" for name in failed]
-
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+        await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
 
 
 async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -328,7 +375,10 @@ def main():
     app.add_handler(
         MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, handle_message)
     )
-    app.add_handler(CallbackQueryHandler(handle_confirmation))
+    app.add_handler(CallbackQueryHandler(handle_menu, pattern=r"^menu:"))
+    app.add_handler(
+        CallbackQueryHandler(handle_confirmation, pattern=r"^(confirm_post|cancel_post)$")
+    )
     app.add_error_handler(error_handler)
     logger.info("Bot starting (polling)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

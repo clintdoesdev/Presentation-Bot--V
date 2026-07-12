@@ -49,21 +49,22 @@ The bot replies with a preview (same buttons + a Confirm/Cancel row). Tap
 
 ## 5. Download forwarded audio
 
-Forward the bot one or more audio files (or voice notes) — it downloads
-each one to the `downloads/` folder on the server. If you forward several
-at once, it waits a beat for them all to land, then saves them numbered in
-the order they were forwarded (`01 - Track One.mp3`, `02 - Track Two.mp3`,
-...) so the sequence is preserved. A single forward is saved with its
-original name.
+Forward the bot one or more audio files (or voice notes). It converts each
+one to MP3 and sends it right back to you in the chat — tap any file to
+download it straight from Telegram. If you forward several at once, it
+waits a beat for them all to land, then sends them back numbered in the
+order they were forwarded (`01 - Track One.mp3`, `02 - Track Two.mp3`,
+...) so the sequence is preserved. A single forward is sent back with its
+original name (no number).
 
-- **AUDIO_DOWNLOAD_DIR** (optional): where files are saved. Defaults to
-  `downloads/`.
+Conversion uses a bundled `ffmpeg` binary (via the `imageio-ffmpeg` pip
+package), so no separate system install is needed.
+
 - **AUDIO_BATCH_DELAY** (optional): seconds to wait after the last forward
-  before saving the batch. Defaults to `1.5`.
+  before converting and sending the batch. Defaults to `1.5`.
 
-Note: on Railway (or any host without a persistent volume) this folder is
-wiped on every redeploy/restart — fine for grabbing files during a session,
-but don't rely on it as long-term storage.
+The `/start` menu has separate sections for text/photo posts and audio
+downloads — tap a button to see instructions for that feature.
 
 ## 6. Deploy to Railway
 1. Push this folder to a new GitHub repo.
