@@ -3,6 +3,7 @@ import re
 import logging
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -27,6 +28,11 @@ ADMIN_IDS = {
 
 # Matches things like: [REGISTER NOW - https://vireonwebsite.com.ng]
 BUTTON_PATTERN = re.compile(r"\[\s*([^\[\]\-]+?)\s*-\s*(https?://[^\s\]]+)\s*\]")
+
+# Telegram's hard limits — going over these causes a BadRequest and, without
+# an error handler, a silently "dead" bot.
+PHOTO_CAPTION_LIMIT = 1024
+TEXT_MESSAGE_LIMIT = 4096
 
 
 def parse_buttons(text: str):
@@ -82,6 +88,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cleaned_text, buttons = parse_buttons(raw_text)
 
+    # Check against Telegram's real limits BEFORE attempting to send anything.
+    # (Tags like [Label - URL] are already stripped out, so this reflects the
+    # actual visible length.)
+    limit = PHOTO_CAPTION_LIMIT if photo else TEXT_MESSAGE_LIMIT
+    if len(cleaned_text) > limit:
+        over = len(cleaned_text) - limit
+        kind = "photo caption" if photo else "message"
+        tip = (
+            "Trim it, or send the photo on its own and the full copy as a separate text post."
+            if photo
+            else "Trim it and resend."
+        )
+        await msg.reply_text(
+            f"⚠️ That {kind} is {len(cleaned_text)} characters — {over} over Telegram's "
+            f"{limit}-character limit. {tip}"
+        )
+        return
+
     # Stash the pending post for this admin until they confirm.
     context.user_data["pending_post"] = {
         "photo": photo,
@@ -99,16 +123,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     )
     preview_markup = InlineKeyboardMarkup(preview_rows)
-    note = f"\n\n— PREVIEW — {len(buttons)} button(s) attached —"
 
-    if photo:
-        await msg.reply_photo(
-            photo=photo,
-            caption=(cleaned_text or "") + note,
-            reply_markup=preview_markup,
-        )
-    else:
-        await msg.reply_text((cleaned_text or "") + note, reply_markup=preview_markup)
+    try:
+        if photo:
+            await msg.reply_photo(
+                photo=photo,
+                caption=cleaned_text or None,
+                reply_markup=preview_markup,
+            )
+        else:
+            await msg.reply_text(cleaned_text, reply_markup=preview_markup)
+        await msg.reply_text(f"👆 Preview — {len(buttons)} button(s) attached. Confirm to post.")
+    except BadRequest as e:
+        logger.exception("Failed to build preview")
+        context.user_data.pop("pending_post", None)
+        await msg.reply_text(f"⚠️ Telegram rejected that message: {e}")
 
 
 async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -154,6 +183,19 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
             context.user_data.pop("pending_post", None)
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    """Catch-all so a crash gets reported to you instead of just logged and forgotten."""
+    logger.error("Unhandled exception while processing an update", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"⚠️ Something went wrong: {context.error}",
+            )
+        except Exception:
+            pass  # don't let a failed error-report crash the error handler itself
+
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -161,6 +203,7 @@ def main():
         MessageHandler((filters.TEXT | filters.PHOTO) & ~filters.COMMAND, handle_message)
     )
     app.add_handler(CallbackQueryHandler(handle_confirmation))
+    app.add_error_handler(error_handler)
     logger.info("Bot starting (polling)...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
